@@ -12,22 +12,24 @@ import { DiscoveryProtocol } from './lib/DiscoveryProtocol';
 winston.loggers.add('DiscoveryProtocol', {
     console: {
         level: 'silly',
-        colorize: true,
-        label: 'DiscoveryProtocol',
-        timestamp: true
+            colorize: true,
+            label: 'devp2p',
+            timestamp: true
     }
 });
 
 let discovery = new DiscoveryProtocol();
 
 discovery.privateKey = "59e8fcddc11590e4baac204e376a2ae9e3f50455474bc7a864a9e670764a3ffb";
+discovery.start(["52.59.174.100:40304"])
+/*
 discovery.startInternal( () => {
     discovery.pingPong(Node.fromIpAndPort('52.59.174.100', 40304)).then(() => {
         console.log("Yeah, it WORKS!!");
     }).catch((err) => {
         console.log("Oops... error: " + err);
     })
-});
+});*/
 
 
 /*let rawData = [

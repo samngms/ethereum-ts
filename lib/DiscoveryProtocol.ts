@@ -3,12 +3,13 @@ import * as winston from 'winston';
 import * as dgram from "dgram";
 import * as ip from "ip";
 import * as rlp from 'rlp';
-import { keccak_256 } from 'js-sha3';
+import { keccak256 } from 'js-sha3';
 import {AddressInfo} from "dgram";
 import {EventEmitter} from "events";
 import {isNullOrUndefined} from "util";
 import {Endpoint} from "./Endpoint";
 import {Node} from "./Node";
+import {BucketManger} from "./BucketManger";
 
 // internal use only
 interface PingRegistryObject {
@@ -22,19 +23,18 @@ interface PingRegistryObject {
 }
 
 export class DiscoveryProtocol {
+    private bucketManager : BucketManger;
     private started = false;
     private node: Node = Node.fromIpAndPort("127.0.0.1", 30303); // this node
     private key: elliptic.KeyPair;
     private ec = new elliptic.ec('secp256k1');
     private server = dgram.createSocket('udp4');
 
-    /** Map hash string to PingRegistryObject
+    /**
      * When we PING, we will put the hash into this map.
      * And when when we receive the PONG, we will check if the PingRegistryObject exists, the expiry time, source IP, and public key if exist
-     *
-     * @type { [name: string]: number }
      */
-    private pingRegistry : { [name: string]: PingRegistryObject} = {};
+    private pingRegistry = new Map<string, PingRegistryObject>();
 
     /** expiry time, used for timestamp in almost all data structures, unit in second */
     public expiryTime = 5;
@@ -42,6 +42,8 @@ export class DiscoveryProtocol {
     public log = winston.loggers.get('DiscoveryProtocol');
 
     constructor() {
+        this.bucketManager = new BucketManger(this.node, this);
+
         this.server.on('error', (err) => {
             this.log.error('Network error', err);
         });
@@ -87,20 +89,28 @@ export class DiscoveryProtocol {
         this.key = this.ec.keyFromPrivate(value);
 
         // setup node Id as well
-        this.node.nodeId = DiscoveryProtocol.publicKeyToNodeId(this.key.getPublic());
+        // I don't know the meaning of the first parameter to encode(), but second parameter is compress
+        // as for slice(1), the first byte is always '0x04', and is not included in nodeId
+        this.node.nodeId = this.key.getPublic().encode(true, false).slice(1)
     }
 
     /** you shouldn't call this one, use start(string[]) instead
      *
-     * @param {Function} callback
+     * @returns {Promise<any>}
      */
-    public startInternal(callback: Function) {
+    public startInternal() {
         if ( this.started ) return;
 
-        this.server.bind(this.node.endpoint.udp, () => {
-            this.started = true;
-            callback();
-        })
+        return new Promise((resolve) => {
+            this.server.bind(this.node.endpoint.udp, () => {
+                this.started = true;
+                resolve();
+            })
+        });
+    }
+
+    public start(initPeers: string[]) {
+        this.bucketManager.start(initPeers);
     }
 
     public stop(callback: Function) {
@@ -117,7 +127,7 @@ export class DiscoveryProtocol {
     }
 
     public onMessage(msg: Buffer, rinfo: AddressInfo) {
-        this.log.debug("UDP packet received", rinfo);
+        this.log.silly("UDP packet received", rinfo);
 
         // hash (32-byte) || signature (65-byte) || packet-type (1-byte) || packet-data (variable length)
         if ( msg.length < 32+65+1+1 ) {
@@ -126,22 +136,27 @@ export class DiscoveryProtocol {
         }
 
         // verify the hash
-        let hasher = keccak_256.create().update(msg.slice(32));
+        let hasher = keccak256.create().update(msg.slice(32));
         if ( 0 != msg.compare(Buffer.from(hasher.digest()), 0,32, 0, 32) ) {
             this.log.debug("Dropping packet due to invalid hash", {calculated: hasher.hex(), received: msg.slice(0, 32).toString('hex')});
             return;
         }
 
         // verify the signature
-        let sigHasher = keccak_256.create().update(msg.slice(32+65));
+        let sigHasher = keccak256.create().update(msg.slice(32+65));
         let signature = {r: msg.slice(32, 64), s: msg.slice(64, 32+64), recoveryParam: msg[32+64]};
-        let pubKey: any;
+        let remoteId: number[];
         try {
-            pubKey = this.ec.recoverPubKey(sigHasher.digest(), signature, signature.recoveryParam);
+            // the return from recoverPubKey is a complex object
+            let pubKey = this.ec.recoverPubKey(sigHasher.digest(), signature, signature.recoveryParam);
             if ( !this.ec.verify(sigHasher.digest(), signature, pubKey) ) {
                 this.log.debug("Dropping packet to due signature verification failed", signature);
                 return;
             }
+            // the return from recoverPubKey is a complex object
+            // I don't know the meaning of the first parameter to encode(), but second parameter is compress
+            // as for slice(1), the first byte is always '0x04', and is not included in nodeId
+            remoteId = pubKey.encode(true, false).slice(1);
         } catch (err) {
             this.log.debug("Dropping packet to due invalid signature", err);
             return;
@@ -160,10 +175,10 @@ export class DiscoveryProtocol {
         try {
             if (packetType === 0x01) {
                 // Ping packet
-                this.handlePingReceived(rinfo, pubKey, hasher.digest(), decoded);
+                this.handlePingReceived(rinfo, remoteId, hasher.digest(), decoded);
             } else if (packetType === 0x02) {
                 // Pong packet
-                this.handlePongReceived(rinfo, pubKey, decoded);
+                this.handlePongReceived(rinfo, remoteId, decoded);
             } else if (packetType === 0x03) {
                 // FindNeighbours
                 this.log.info("FindNeighbours packet received");
@@ -182,7 +197,7 @@ export class DiscoveryProtocol {
      *
      * @param {Node} remote
      * @param {number} retry default value is 2, meaning total try 3 times
-     * @returns {Promise<{rinfo: AddressInfo, pubKey: any>} a promise that resolve if both ping and pong are successful, reject otherwise.
+     * @returns {Promise<{rinfo: AddressInfo, pubKey: Buffer>} a promise that resolve if both ping and pong are successful, reject otherwise.
      */
     public pingPong(remote: Node, retry = 2) {
         let eventEmitter = new EventEmitter();
@@ -194,10 +209,10 @@ export class DiscoveryProtocol {
             return new Promise((resolve, reject) => {
                 let done = false;
                 let h = pingPacketHash.slice(0, 32).toString('hex')
-                eventEmitter.once(h, (rinfo: AddressInfo, pubKey: any) => {
+                eventEmitter.once(h, (rinfo: AddressInfo, remoteId: number[]) => {
                     if (!done ) {
                         done = true;
-                        resolve({rinfo: rinfo, pubKey: pubKey});
+                        resolve({rinfo: rinfo, remoteId: remoteId});
                     }
                 });
                 setTimeout(() => {
@@ -219,12 +234,9 @@ export class DiscoveryProtocol {
 
     /** send a PING request to a remote node
      * The function will register the relevant data to the PingRegistry so that when we receive a PONG, we will be able to correlate the two
-     * @param {string} remoteAddr remote peer IP address
-     * @param {number} remoteUdp remote peer UDP address
-     * @param {number} remoteTcp remote peer TCP address (we need to put the remote TCP port number in the PING data structure)
-     * @param pubKey the public key (i.e. nodeId) of the ping host, can be null (the only case that it is null is for bootstrap peers specified in IP:port format). We will use verify the PONG packet against the pubKey if it is available, and only verify the ip address if pubKey is null. It is more secure if pubKey is provided
+     * @param {Node} remote
      * @param {"events".internal.EventEmitter} eventEmitter can be null
-     * @returns {Promise<packet: Buffer>}
+     * @returns {Promise<Buffer>} promise full packet as a buffer
      */
     public ping(remote: Node, eventEmitter: EventEmitter) {
         let record = [
@@ -254,12 +266,12 @@ export class DiscoveryProtocol {
     /** handle a PING request (another node PING us)
      *
      * @param {"dgram".AddressInfo} rinfo
-     * @param {any} the recovered sender public key in {r, s, recoveryParam} format
+     * @param {AddressInfo} rinfo the remote node to ping
+     * @param {number[]} remoteId the remote nodeId
      * @param {number[]} hash the hash or the received packet, we need this in the PONG reply
      * @param {Array<any>} data expected to be the output from rlp.decode(packet_data)
      */
-    public handlePingReceived(rinfo: AddressInfo, pubKey: any, hash: number[], data: Array<any>) {
-        console.log(data);
+    public handlePingReceived(rinfo: AddressInfo, remoteId: number[], hash: number[], data: Array<any>) {
         let version = (data[0].readUInt8(0));
         let remoteEndpoint = this.toEndPoint(data[1] as Array<Buffer>);
         let myEndpoint = this.toEndPoint(data[2] as Array<Buffer>);
@@ -278,6 +290,8 @@ export class DiscoveryProtocol {
             this.log.debug("Ignore PING request due to invalid timestamp", {packet_time: timestamp});
         }
 
+        this.log.debug("PING data received", {remote: rinfo, local: myEndpoint, hash: Buffer.from(hash).toString('hex'), timestamp: timestamp});
+
         // auto reply with a PONG
         // note: we reply with rinfo, not peerEndpoint beacuse it might be behind NAT
         this.pong(new Endpoint(rinfo.address, rinfo.port, remoteEndpoint.tcp), hash);
@@ -285,9 +299,7 @@ export class DiscoveryProtocol {
 
     /** send a PONG request back to the remote node
      *
-     * @param {string} remoteAddr
-     * @param {number} remoteUdp
-     * @param {number} remoteTcp
+     * @param {Endpoint} remote node to pong
      * @param {number[]} lastPingHash the hash of the received PING packet
      * @returns {Promise<Buffer>}
      */
@@ -309,10 +321,10 @@ export class DiscoveryProtocol {
     /** handle the received PONG request
      *
      * @param {"dgram".AddressInfo} rinfo
-     * @param {any} pubKey the recovered sender public key in {r, s, recoveryParam} format
+     * @param {number[]} remoteId the recovered sender public key, total 64 bytes long, w/o leading '0x04'
      * @param {Array<any>} packetData expected to be the output from rlp.decode(packet_data)
      */
-    public handlePongReceived(rinfo: AddressInfo, pubKey: any, packetData: Array<any>) : void {
+    public handlePongReceived(rinfo: AddressInfo, remoteId: number[], packetData: Array<any>) : void {
         let endpoint = this.toEndPoint(packetData[0] as Array<Buffer>); // this is my address:port seen by the peer
         let hash = packetData[1] as Buffer;
         let timestamp = (packetData[2] as Buffer).readUInt32BE(0);
@@ -327,14 +339,14 @@ export class DiscoveryProtocol {
         // "+expiryTime" as suggested by Ethereum protocol, see https://github.com/ethereum/devp2p/blob/master/rlpx.md section "Node Discovery"
         if ( (registry.timestamp+this.expiryTime < this.now())
             || (!registry.remote.nodeId && registry.remote.endpoint.ip != rinfo.address) // we check ip only if we don't have the public key (nodeId)
-            || (registry.remote.nodeId && registry.remote.nodeId != DiscoveryProtocol.publicKeyToNodeId(pubKey)) ) {
+            || (registry.remote.nodeId && registry.remote.nodeId != remoteId) ) {
 
             if ( registry.timestamp+this.expiryTime < this.now() ) {
                 this.log.debug("Dropping expired PONG packet: " + new Date(registry.timestamp*1000));
             } else if ( !registry.remote.nodeId && registry.remote.endpoint.ip != rinfo.address ) {
                 this.log.debug("Dropping PONG packet from unexpected IP", {expected: registry.remote.endpoint.ip, actual: rinfo.address});
             } else {
-                this.log.debug("Dropping PONG packet with another nodeId", {expected: registry.remote.nodeId, actual: DiscoveryProtocol.publicKeyToNodeId(pubKey)});
+                this.log.debug("Dropping PONG packet with another nodeId", {expected: registry.remote.nodeId, actual: remoteId});
             }
             // if we don't clear all listener, we may have memory leak
             if ( !isNullOrUndefined(registry.eventEmitter) ) registry.eventEmitter.removeAllListeners();
@@ -342,20 +354,13 @@ export class DiscoveryProtocol {
             return;
         }
 
-        this.log.debug("PONG data received", {endpoint: endpoint, hash: hash.toString('hex'), timestamp: timestamp});
+        this.log.debug("PONG data received", {remote: rinfo, local: endpoint, hash: hash.toString('hex'), timestamp: timestamp});
 
         if ( !isNullOrUndefined(registry.eventEmitter) ) {
-            registry.eventEmitter.emit(pingHash, rinfo, pubKey);
+            registry.eventEmitter.emit(pingHash, rinfo, remoteId);
             registry.eventEmitter.removeAllListeners();
         }
         delete this.pingRegistry[pingHash];
-    }
-
-    static publicKeyToNodeId(pubKey: any): Buffer {
-        let buf = new Buffer(65);
-        buf.set(pubKey.x, 0);
-        buf.set(pubKey.y, 32);
-        return buf;
     }
 
     public toEndPoint(data: Array<Buffer>) {
@@ -400,7 +405,7 @@ export class DiscoveryProtocol {
         packet.set(signature.s.toArray(), 32+32);
         packet.set([signature.recoveryParam], 32+64);
 
-        let hasher = keccak_256.create().update(packet.slice(32));
+        let hasher = keccak256.create().update(packet.slice(32));
         packet.set(hasher.digest());
 
         if ( null != beforeSend ) beforeSend(packet);
@@ -416,7 +421,7 @@ export class DiscoveryProtocol {
     }
 
     private recoverableSignature(data: Buffer) {
-        let hasher = keccak_256.create().update(data);
+        let hasher = keccak256.create().update(data);
         return this.key.sign(hasher.digest(), { canonical: 1 });
     }
 }

@@ -1,5 +1,5 @@
 import * as BN from 'bn';
-import {keccak_256} from "js-sha3";
+import {keccak256} from "js-sha3";
 import {isNullOrUndefined, isUndefined} from "util";
 import * as winston from 'winston';
 import {DiscoveryProtocol} from "./DiscoveryProtocol";
@@ -92,18 +92,18 @@ export class BucketManger {
 
     private buckets: Array<Bucket>;
 
-    public log = winston.loggers.get('BucketManager');
+    public log = winston.loggers.get('DiscoveryProtocol');
 
-    constructor(private hash: number[], private dp: DiscoveryProtocol) {
+    constructor(private owner: Node, private dp: DiscoveryProtocol) {
         this.buckets = new Array<Bucket>(this.NO_OF_BUCKETS);
         for(let i=0; i<this.buckets.length; i++) {
             this.buckets[i] = new Bucket(dp);
         }
     }
 
-    public start(bootstrapList: string[]) {
+    public start(initPeers: string[]) {
         let array = [];
-        bootstrapList.forEach((item) => {
+        initPeers.forEach((item) => {
             if ( /^enode:\/\/[0-9a-fA-F]{65}@\d{1,3}(\.\d{1,3}){3}:\d{1,5}(\?.*)?"$/.test(item) ) {
                 array.push(Node.fromUrl(item));
             } else if ( /^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$/.test(item) ) {
@@ -113,18 +113,23 @@ export class BucketManger {
                 throw new Error("Invalid bootstrap peer: " + item);
             }
         });
-        this.dp.startInternal( () => {
+
+        this.log.info("My nodeId: " + Buffer.from(this.owner.nodeId).toString('hex'));
+
+        this.dp.startInternal().then(() => {
             array.forEach((node) => {
-                this.dp.pingPong(node).then((result : {rinfo: AddressInfo, pubKey: any}) => {
-                    if ( !node.nodeId ) node.nodeId = DiscoveryProtocol.publicKeyToNodeId(result.pubKey);
+                this.dp.pingPong(node).then((result : {rinfo: AddressInfo, remoteId: number[]}) => {
+                    if ( !node.nodeId ) node.nodeId = result.remoteId;
                     this.touchNode(BucketManger.keccak256(node.nodeId), node);
-                });
+                }).catch(error => {
+                    this.log.info("Error Ping-Pong " + node, error);
+                })
             });
         });
     }
 
     static keccak256(input: Buffer) : number[] {
-        let hasher = keccak_256.create().update(input);
+        let hasher = keccak256.create().update(input);
         return hasher.digest();
     }
 
@@ -138,7 +143,7 @@ export class BucketManger {
             return;
         }
 
-        let dist = this.distance(this.hash, hash);
+        let dist = this.distance(this.owner.hash, hash);
         let bucket = this.buckets[dist];
         bucket.touchNode(hash, nodeData);
     }
@@ -155,9 +160,10 @@ export class BucketManger {
         let xor = (((hash1[0] ^ hash2[0]) & 0xFF) << 8) + ((hash1[1] ^ hash2[1]) & 0xFF);
 
         let i=0;
-        const one = 1;
+        // check most significant bit first
+        const one = 0x8000;
         while(i<this.NO_OF_BUCKETS) {
-            if ( 0 != (xor & (one << i)) ) {
+            if ( 0 != (xor & (one >> i)) ) {
                 break;
             } else {
                 i++;

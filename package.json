@@ -1,0 +1,35 @@
+{
+  "name": "ethereum-ts",
+  "version": "0.1.0",
+  "description": "Ethereum Client implemented purely in TypeScript",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/samngms/ethereum-ts.git"
+  },
+  "keywords": [
+    "ethereum"
+  ],
+  "author": "samngms@gmail.com",
+  "license": "LGPL-3.0",
+  "bugs": {
+    "url": "https://github.com/samngms/ethereum-ts/issues"
+  },
+  "homepage": "https://github.com/samngms/ethereum-ts#readme",
+  "dependencies": {
+    "@types/bunyan": "^1.8.4",
+    "@types/ip": "^0.0.30",
+    "@types/node": "^9.4.7",
+    "bn": "^1.0.1",
+    "bn.js": "^4.11.8",
+    "crypto-js": "^3.1.9-1",
+    "elliptic": "^6.4.0",
+    "ip": "^1.1.5",
+    "js-sha3": "^0.7.0",
+    "rlp": "^2.0.0",
+    "winston": "^2.4.1"
+  }
+}

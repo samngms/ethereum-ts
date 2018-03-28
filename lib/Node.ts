@@ -2,11 +2,12 @@ import { Endpoint } from './Endpoint';
 import * as BN from 'bn';
 import {URL} from "url";
 import {isNullOrUndefined} from "util";
+import {keccak256} from "js-sha3";
 
 export class Node {
     public endpoint: Endpoint;
     public nodeId: Buffer;
-    public hashId: number[];
+    public _hash: number[];
 
     static fromUrl(url: string) : Node {
         let u = new URL(url);
@@ -27,6 +28,15 @@ export class Node {
         let n = new Node();
         n.endpoint = new Endpoint(ip, udp, udp);
         return n;
+    }
+
+    public get hash() : number[] {
+        if ( null == this.nodeId ) return null;
+
+        if ( isNullOrUndefined(this._hash) ) {
+            this._hash = keccak256.create().update(this.nodeId).digest();
+        }
+        return this._hash;
     }
 }
 
