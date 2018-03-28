@@ -7,9 +7,9 @@ import * as BN from 'bn.js';
 import * as fs from "fs";
 import * as winston from 'winston';
 import {Node} from "./lib/Node";
-import { DiscoveryProtocol } from './lib/DiscoveryProtocol';
+import { NodeDiscovery } from './lib/NodeDiscovery';
 
-winston.loggers.add('DiscoveryProtocol', {
+winston.loggers.add('devp2p', {
     console: {
         level: 'silly',
             colorize: true,
@@ -18,7 +18,7 @@ winston.loggers.add('DiscoveryProtocol', {
     }
 });
 
-let discovery = new DiscoveryProtocol();
+let discovery = new NodeDiscovery();
 
 discovery.privateKey = "59e8fcddc11590e4baac204e376a2ae9e3f50455474bc7a864a9e670764a3ffb";
 discovery.start(["52.59.174.100:40304"])

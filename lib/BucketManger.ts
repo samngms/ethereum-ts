@@ -2,7 +2,7 @@ import * as BN from 'bn';
 import {keccak256} from "js-sha3";
 import {isNullOrUndefined, isUndefined} from "util";
 import * as winston from 'winston';
-import {DiscoveryProtocol} from "./DiscoveryProtocol";
+import {NodeDiscovery} from "./NodeDiscovery";
 import {Node} from './Node';
 import {AddressInfo} from "dgram";
 
@@ -34,9 +34,9 @@ class Bucket {
     public lastRefresh: number;
     public lastAccess: number;
 
-    public log = winston.loggers.get('BucketManager');
+    public log = winston.loggers.get('devp2p');
 
-    constructor(private dp: DiscoveryProtocol) {
+    constructor(private discovery: NodeDiscovery) {
         this.list = [];
         this.lastAccess = new Date().getTime();
         this.lastRefresh = this.lastAccess;
@@ -48,7 +48,7 @@ class Bucket {
             if ( this.list.length >= this.BUCKET_SIZE ) {
                 // we *may* need to remove the last node
                 let item = this.list.pop();
-                this.dp.pingPong(item.nodeData).then((result : {rinfo: AddressInfo, pubKey: any}) => {
+                this.discovery.pingPong(item.nodeData).then((result : {rinfo: AddressInfo, pubKey: any}) => {
                     // pingPong successful, keep old data
                 }).catch((error: any) => {
                     // pingPong failed, replace with new data
@@ -92,12 +92,12 @@ export class BucketManger {
 
     private buckets: Array<Bucket>;
 
-    public log = winston.loggers.get('DiscoveryProtocol');
+    public log = winston.loggers.get('devp2p');
 
-    constructor(private owner: Node, private dp: DiscoveryProtocol) {
+    constructor(private owner: Node, private discovery: NodeDiscovery) {
         this.buckets = new Array<Bucket>(this.NO_OF_BUCKETS);
         for(let i=0; i<this.buckets.length; i++) {
-            this.buckets[i] = new Bucket(dp);
+            this.buckets[i] = new Bucket(discovery);
         }
     }
 
@@ -116,9 +116,9 @@ export class BucketManger {
 
         this.log.info("My nodeId: " + Buffer.from(this.owner.nodeId).toString('hex'));
 
-        this.dp.startInternal().then(() => {
+        this.discovery.startInternal().then(() => {
             array.forEach((node) => {
-                this.dp.pingPong(node).then((result : {rinfo: AddressInfo, remoteId: number[]}) => {
+                this.discovery.pingPong(node).then((result : {rinfo: AddressInfo, remoteId: number[]}) => {
                     if ( !node.nodeId ) node.nodeId = result.remoteId;
                     this.touchNode(BucketManger.keccak256(node.nodeId), node);
                 }).catch(error => {

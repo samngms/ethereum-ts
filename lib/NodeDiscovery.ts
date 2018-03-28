@@ -22,7 +22,7 @@ interface PingRegistryObject {
     eventEmitter: EventEmitter;
 }
 
-export class DiscoveryProtocol {
+export class NodeDiscovery {
     private bucketManager : BucketManger;
     private started = false;
     private node: Node = Node.fromIpAndPort("127.0.0.1", 30303); // this node
@@ -39,7 +39,7 @@ export class DiscoveryProtocol {
     /** expiry time, used for timestamp in almost all data structures, unit in second */
     public expiryTime = 5;
 
-    public log = winston.loggers.get('DiscoveryProtocol');
+    public log = winston.loggers.get('devp2p');
 
     constructor() {
         this.bucketManager = new BucketManger(this.node, this);
