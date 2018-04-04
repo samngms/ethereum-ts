@@ -253,13 +253,13 @@ export class NodeDiscovery {
 
         // ping packet type is 0x01
         return this.send(remote.endpoint, 0x01, data, (packet: Buffer) => {
-            let r = {
+            let item = {
                 packetHash: packet.slice(0, 32).toString('hex'),
                 timestamp: this.now() + 2 * this.expiryTime,
                 remote: remote,
                 eventEmitter: eventEmitter
             };
-            this.pingRegistry[r.packetHash] = r;
+            this.pingRegistry[item.packetHash] = item;
         });
     }
 
@@ -368,7 +368,7 @@ export class NodeDiscovery {
     }
 
     /** convert a buffer into a port number
-     * Why we do this? Because the port can be 2 bytes (e.g. 30303 = 0x765f), or 1 byte (e.g. 80), or can be empty!!
+     * Why we do this? Because the port can be 2 bytes (e.g. 30303 = 0x765f), 1 byte (e.g. 80), or can be empty!!
      * Empty is seen from Geth PING request, when Geth PING me, maybe because my TCP port is not sure yet, it is left empty
      * @param {Buffer} data
      * @returns {number} the converted port number, it can be 0
@@ -385,12 +385,11 @@ export class NodeDiscovery {
 
     /**
      *
-     * @param {string} peerAddr
-     * @param {number} peerUdp
+     * @param {Endpoint} remote
      * @param {number} packetType
      * @param {Buffer} packetData
      * @param {(b: Buffer) => void} beforeSend
-     * @returns {Promise<packet: Buffer>}
+     * @returns {Promise<Buffer>} the packet packed in Promise<Buffer>
      */
     public send(remote: Endpoint, packetType: number, packetData: Buffer, beforeSend?: (b: Buffer) => void ) : Promise<Buffer> {
         // first 32-byte are for the packet.hash, next 65-byte are for signature (32+32+1), the last "1" is for packetType
@@ -400,7 +399,7 @@ export class NodeDiscovery {
         packet.set([packetType], 32+65);
         packet.set(packetData, 32+65+1);
 
-        let signature = this.recoverableSignature(packet.slice(32+65));
+        let signature = this.recoverableSign(packet.slice(32+65));
         packet.set(signature.r.toArray(), 32);
         packet.set(signature.s.toArray(), 32+32);
         packet.set([signature.recoveryParam], 32+64);
@@ -420,8 +419,9 @@ export class NodeDiscovery {
         });
     }
 
-    private recoverableSignature(data: Buffer) {
+    private recoverableSign(data: Buffer) {
         let hasher = keccak256.create().update(data);
+        // canonical:1 is critical in here
         return this.key.sign(hasher.digest(), { canonical: 1 });
     }
 }
