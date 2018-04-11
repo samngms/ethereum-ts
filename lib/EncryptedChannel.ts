@@ -9,8 +9,11 @@ import {Cipher, Decipher} from "crypto";
 import {Mac} from "./Mac";
 import * as rlp from 'rlp';
 import {EventEmitter} from "events";
+import {pubk2id} from "./Util";
 
-/** header: frame-size || header-data || padding
+/** A frame header, for internal use only
+ * <pre>
+ * header: frame-size || header-data || padding
  *     frame-size: 3-byte integer size of frame, big endian encoded (excludes padding)
  * header-data:
  *     normal: rlp.list(protocol-type[, context-id])
@@ -21,6 +24,7 @@ import {EventEmitter} from "events";
  *     context-id: < 2**16 (optional for normal frames)
  *     total-packet-size: < 2**32
  *     padding: zero-fill to 16-byte boundary
+ * </pre>
  */
 class FrameHeader {
     constructor(public frameSize: number, public protocolType=0, public contextId=0, public totalPacketSize=0) { }
@@ -59,12 +63,12 @@ class FrameHeader {
 
         const size = (input.readUInt8(0) << 16) + (input.readUInt8(1) << 8) + input.readUInt8(2);
         const payload = rlp.decode(input.slice(3), true);
-        const count = payload.length;
+        const count = payload.data.length;
         assert.ok(count > 0, 'Invalid frame header, expect at least the protocol-type but contains no data');
         assert.ok(count <= 3, `Invalid frame header, expect at most 3 items but there are ${count} elements`);
         const pType = payload[0];
-        const id = (count > 1) ? payload[1] : 0;
-        const total = (count > 2) ? payload[2] : 0;
+        const id = (count > 1) ? payload.data[1] : 0;
+        const total = (count > 2) ? payload.data[2] : 0;
         return new FrameHeader(size, pType, id, total);
     }
 }
@@ -406,9 +410,7 @@ export class EncryptedChannel extends EventEmitter {
         ])
         console.log(`signature: ${xyz.toString('hex')}`);
 
-        // I don't know the meaning of the first parameter to encode(), but second parameter is compress
-        // as for slice(1), the first byte is always '0x04', and is not included
-        const hash = keccak256.create().update(this.localEphemeralKey.getPublic().encode(true, false).slice(1)).digest();
+        const hash = keccak256.create().update(pubk2id(this.localEphemeralKey.getPublic())).digest();
         console.log(`hash: ${hash}`);
 
         // signature(32+32+1) || hash(32) || pubk(64) || nonce(32) || 0x0
@@ -417,7 +419,7 @@ export class EncryptedChannel extends EventEmitter {
             Buffer.from(signature.s.toArray()),
             Buffer.from([signature.recoveryParam]),
             Buffer.from(hash),
-            Buffer.from(this.key.getPublic().encode(true, false).slice(1)),
+            pubk2id(this.key.getPublic()),
             this.localNonce,
             Buffer.from([0])
         ]);
@@ -435,7 +437,7 @@ export class EncryptedChannel extends EventEmitter {
                 {name: "eth", version: 62 }
             ],
             30303,
-            this.key.getPublic().encode(true, false).slice(1)
+            pubk2id(this.key.getPublic())
         ];
         return this.sendFrame(0x00, rlp.encode(msgBody));
     }
