@@ -1,20 +1,20 @@
-import * as BN from 'bn';
 import {keccak256} from "js-sha3";
-import {isNullOrUndefined, isUndefined} from "util";
-import * as winston from 'winston';
+import * as log4js from '@log4js-node/log4js-api';
 import {NodeDiscovery} from "./NodeDiscovery";
 import {Node} from './Node';
 import {AddressInfo} from "dgram";
+import {Endpoint} from "./Endpoint";
+import * as _ from 'lodash';
+import * as assert from "assert";
 
 class BucketItem {
-    private lastAccess: number;
+    public lastAccess: number;
 
     /**
      *
-     * @param {number[]} hash note: this.hash != node.nodeId, this.hash = keccak256(node.nodeId)
      * @param {Node} node
      */
-    constructor(public hash: number[], public nodeData: Node) {
+    constructor(public node: Node) {
 
     }
 
@@ -29,12 +29,14 @@ class Bucket {
      * @type {number}
      */
     private BUCKET_SIZE = 16;
+    private challengeInProgress = 0;
+    private pendingEvictionChallengers = [];
 
     public list: Array<BucketItem>;
     public lastRefresh: number;
     public lastAccess: number;
 
-    public log = winston.loggers.get('devp2p');
+    public log = log4js.getLogger('devp2p.Bucket');
 
     constructor(private discovery: NodeDiscovery) {
         this.list = [];
@@ -42,37 +44,69 @@ class Bucket {
         this.lastRefresh = this.lastAccess;
     }
 
-    public touchNode(hash: number[], nodeData: Node) {
-        let idx = this.findNode(hash);
-        if ( idx == -1 ) {
-            if ( this.list.length >= this.BUCKET_SIZE ) {
-                // we *may* need to remove the last node
-                let item = this.list.pop();
-                this.discovery.pingPong(item.nodeData).then((result : {rinfo: AddressInfo, pubKey: any}) => {
-                    // pingPong successful, keep old data
-                }).catch((error: any) => {
-                    // pingPong failed, replace with new data
-                    let i = this.findNode(item.hash);
-                    if ( -1 != i ) {
-                        this.list.splice(i, 1);
-                    } else {
-                        this.log.warn("Trying to delete a node from Bucket but it is no longer exist", nodeData);
-                    }
-                    this.list.push(new BucketItem(hash, nodeData));
-                })
+    public touchNode(node: Node) {
+        // TODO: cache the calculation of node.hash to improve performance
+        let idx = this.findNode(node.hash);
+        if ( idx === -1 ) {
+            assert.ok(this.list.length <= this.BUCKET_SIZE, 'Bucket size larger than BUCKET_SIZE');
+
+            if ( this.list.length === this.BUCKET_SIZE ) {
+                this.challengeLast(node);
             } else {
-                this.list.push(new BucketItem(hash, nodeData));
+                this.list.unshift(new BucketItem(node));
             }
         } else {
             let item = this.list[idx];
             item.touchNode();
-            this.list.slice(idx, 1);
-            this.list.unshift(item);
+            if ( idx > 0 ) {
+                // move it to the front
+                this.list.slice(idx, 1);
+                this.list.unshift(item);
+            }
         }
     }
 
     public findNode(hash: number[]) {
-        return this.list.findIndex( x => x.hash == hash );
+        return this.list.findIndex( x => _.isEqual(x.node.hash, hash) );
+    }
+
+    /** ping the least recently accessed node (the last node), if no pong rely, remove it and add challenger to the head, otherwise, drop challenger
+     * Note: there is a special case when two pings are received at almost the same time
+     *       i.e. we may be handling (waiting for pong reply) while we want to run evictLast again
+     *       in that case, we will just put the challenger in an array and let the other "thread" to do this for us
+     * @param {Node} challenger
+     */
+    private challengeLast(challenger: Node) {
+        if ( this.challengeInProgress ) {
+            // if we are already running an eviction process, we will rely on another "thread" to do it for us
+            this.pendingEvictionChallengers.push(challenger);
+        } else {
+            // while-loop because we may need to handle other items in pendingEvictionChallengers[] array as well
+            while(challenger) {
+                let lastItem = this.list[this.list.length - 1];
+                // just a safe-guard, if the lastAccess time is within 1 minute, we simply assume the node is still alive
+                if ( lastItem.lastAccess > new Date().getTime()-60*1000 ) {
+                    // do nothing, we ignore the challenger
+                } else {
+                    this.challengeInProgress++;
+                    this.discovery.pingPong(lastItem.node).then((result: { rinfo: AddressInfo, pubKey: any }) => {
+                        // pingPong successful, keep old data
+                        let tmp = this.list.pop();
+                        assert(tmp === lastItem, 'Bucket item mid-air change detected');
+                        lastItem.touchNode();
+                        this.list.unshift(lastItem);
+                        this.challengeInProgress--;
+                    }).catch((error: any) => {
+                        // pingPong failed, replace with new data
+                        let tmp = this.list.pop();
+                        assert(tmp === lastItem, 'Bucket item mid-air change detected');
+                        this.list.unshift(new BucketItem(challenger));
+                        this.challengeInProgress--;
+                    })
+                }
+                challenger = this.pendingEvictionChallengers.shift();
+            }
+        }
     }
 }
 
@@ -92,43 +126,59 @@ export class BucketManger {
 
     private buckets: Array<Bucket>;
 
-    public log = winston.loggers.get('devp2p');
+    public log = log4js.getLogger('devp2p.BucketManager');
 
     constructor(private owner: Node, private discovery: NodeDiscovery) {
         this.buckets = new Array<Bucket>(this.NO_OF_BUCKETS);
         for(let i=0; i<this.buckets.length; i++) {
             this.buckets[i] = new Bucket(discovery);
         }
+
+        discovery.on('pingReceived', (node: Node, hash: number[]) => {
+            this.pingReceived(node, hash);
+        });
     }
 
-    public start(initPeers: string[]) {
+    public async start(initPeers: string[]) {
         let array = [];
         initPeers.forEach((item) => {
-            if ( /^enode:\/\/[0-9a-fA-F]{65}@\d{1,3}(\.\d{1,3}){3}:\d{1,5}(\?.*)?"$/.test(item) ) {
+            if ( /^enode:\/\/[0-9a-fA-F]{128}@\d{1,3}(\.\d{1,3}){3}:\d{1,5}(\?.*)?"$/.test(item) ) {
                 array.push(Node.fromUrl(item));
             } else if ( /^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$/.test(item) ) {
                 let i = item.indexOf(':');
                 array.push(Node.fromIpAndPort(item.substring(0, i), parseInt(item.substring(i+1))));
             } else {
-                throw new Error("Invalid bootstrap peer: " + item);
+                throw new Error(`Invalid bootstrap peer: ${item}`);
             }
         });
 
-        this.log.info("My nodeId: " + Buffer.from(this.owner.nodeId).toString('hex'));
+        this.log.info('Starting BucketManager nodeId: ' + this.owner.nodeId.toString('hex'));
 
-        this.discovery.startInternal().then(() => {
-            array.forEach((node) => {
-                this.discovery.pingPong(node).then((result : {rinfo: AddressInfo, remoteId: number[]}) => {
-                    if ( !node.nodeId ) node.nodeId = result.remoteId;
-                    this.touchNode(BucketManger.keccak256(node.nodeId), node);
-                }).catch(error => {
-                    this.log.info("Error Ping-Pong " + node, error);
-                })
-            });
+        await this.discovery.listen();
+
+        let count = 0;
+        array.forEach((node) => {
+            this.discovery.pingPong(node).then((result : {rinfo: AddressInfo, remoteId: number[]}) => {
+                if ( !node.nodeId ) node.nodeId = result.remoteId;
+                this.touchNode(node);
+                count++;
+            }).catch(error => {
+                this.log.info(`Error Ping-Pong: ${node}`, error);
+            })
         });
+
+        if (!count) throw new Error('No active peer found');
     }
 
-    static keccak256(input: Buffer) : number[] {
+    private pingReceived(remote: Node, hash: number[]) {
+        this.discovery.pong(remote.endpoint, hash).then(() => {
+            this.touchNode(remote);
+        }).catch((err) => {
+            // TODO: maybe we want to re-pong if err=timeout
+        })
+    }
+
+    static hash(input: Buffer) : number[] {
         let hasher = keccak256.create().update(input);
         return hasher.digest();
     }
@@ -136,16 +186,12 @@ export class BucketManger {
     /** Act like UNIX touch command, if the node doesn't exist we will add it to one of the bucket, and then update the last access time
      *
      * @param {number[]} hash expected to be keccak256 hash
-     * @param nodeData contain any valid info about the node, should at least include ip address, udp/tcp ports
+     * @param node contain any valid info about the node, should at least include ip address, udp/tcp ports
      */
-    public touchNode(hash: number[], nodeData: Node) {
-        if ( hash.length < 2 ) {
-            return;
-        }
-
-        let dist = this.distance(this.owner.hash, hash);
+    public touchNode(node: Node) {
+        let dist = this.distance(this.owner.hash, node.hash);
         let bucket = this.buckets[dist];
-        bucket.touchNode(hash, nodeData);
+        bucket.touchNode(node);
     }
 
     /** calculate the distance between two node IDs by XOR
@@ -163,7 +209,7 @@ export class BucketManger {
         // check most significant bit first
         const one = 0x8000;
         while(i<this.NO_OF_BUCKETS) {
-            if ( 0 != (xor & (one >> i)) ) {
+            if ( 0 !== (xor & (one >> i)) ) {
                 break;
             } else {
                 i++;

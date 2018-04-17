@@ -1,15 +1,13 @@
 import * as elliptic from 'elliptic';
-import * as winston from 'winston';
-import * as dgram from "dgram";
+import * as log4js from '@log4js-node/log4js-api';
 import * as ip from "ip";
 import * as rlp from 'rlp';
 import { keccak256 } from 'js-sha3';
-import {AddressInfo} from "dgram";
+import * as dgram from 'dgram';
+import {AddressInfo, Socket} from 'dgram';
 import {EventEmitter} from "events";
-import {isNullOrUndefined} from "util";
 import {Endpoint} from "./Endpoint";
 import {Node} from "./Node";
-import {BucketManger} from "./BucketManger";
 import {pubk2id} from "./Util";
 
 // internal use only
@@ -23,14 +21,9 @@ interface PingRegistryObject {
     eventEmitter: EventEmitter;
 }
 
-export class NodeDiscovery {
-    private bucketManager : BucketManger;
-    private started = false;
-    private node: Node = Node.fromIpAndPort("127.0.0.1", 30303); // this node
-    private key: elliptic.KeyPair;
+export class NodeDiscovery extends EventEmitter {
     private ec = new elliptic.ec('secp256k1');
-    private server = dgram.createSocket('udp4');
-
+    private started = false;
     /**
      * When we PING, we will put the hash into this map.
      * And when when we receive the PONG, we will check if the PingRegistryObject exists, the expiry time, source IP, and public key if exist
@@ -40,64 +33,38 @@ export class NodeDiscovery {
     /** expiry time, used for timestamp in almost all data structures, unit in second */
     public expiryTime = 5;
 
-    public log = winston.loggers.get('devp2p');
+    public log = log4js.getLogger('devp2p.NodeDiscovery');
 
-    constructor() {
-        this.bucketManager = new BucketManger(this.node, this);
+    /**
+     *
+     * @param {Node} node endpoint, id, of this node
+     * @param key the keypair of this node
+     * @param {"dgram".Socket} server
+     */
+    public constructor(private key: any,
+                       private node: Node = Node.fromIpAndPort('127.0.0.1', 30303),
+                       private server: Socket = dgram.createSocket('udp4')) {
+
+        super();
+        if ( !node.nodeId ) node.nodeId = pubk2id(key.getPublic());
 
         this.server.on('error', (err) => {
             this.log.error('Network error', err);
         });
-
         this.server.on('message', (msg: Buffer, rinfo: AddressInfo) => {
             this.onMessage(msg, rinfo);
         });
-
         this.server.on('listening', () => {
             const a = this.server.address();
             this.log.info('Server started', {address: a.address, port: a.port});
         });
-
         this.server.on('close', () => {
             const a = this.server.address();
             this.log.info('Server stopped', {address: a.address, port: a.port});
         });
     }
 
-    public get endpoint() {
-        return new Endpoint(this.node.endpoint.ip, this.node.endpoint.udp, this.node.endpoint.tcp);
-    }
-
-    public set endpoint(value: Endpoint) {
-        if ( this.started ) throw new Error("Can't change end point after the network has started, please call stop() first");
-        this.node.endpoint = new Endpoint(value.ip, value.udp, value.tcp);
-    }
-
-    /** get the public key of this PeerNetwork
-     *
-     * @returns {any}
-     */
-    public get publicKey() {
-        return this.key.getPublic();
-    }
-
-    /** set the private key of this PeerNetwork
-     * The public key will be calculated based on the private key
-     * @param {string} value
-     */
-    public set privateKey(value: string) {
-        if ( this.started ) throw new Error("Can't change encryption key after PeerNetwork has started, please call stop() first");
-        this.key = this.ec.keyFromPrivate(value);
-
-        // setup node Id as well
-        this.node.nodeId = pubk2id(this.key.getPublic());
-    }
-
-    /** you shouldn't call this one, use start(string[]) instead
-     *
-     * @returns {Promise<any>}
-     */
-    public startInternal() {
+    public listen() {
         if ( this.started ) return;
 
         return new Promise((resolve) => {
@@ -108,11 +75,7 @@ export class NodeDiscovery {
         });
     }
 
-    public start(initPeers: string[]) {
-        this.bucketManager.start(initPeers);
-    }
-
-    public stop(callback: Function) {
+    public close(callback: Function) {
         if ( !this.started ) return;
 
         this.server.close(() => {
@@ -126,18 +89,18 @@ export class NodeDiscovery {
     }
 
     public onMessage(msg: Buffer, rinfo: AddressInfo) {
-        this.log.silly("UDP packet received", rinfo);
+        if (this.log.isTraceEnabled()) this.log.trace('Received UDP packet', rinfo, msg);
 
         // hash (32-byte) || signature (65-byte) || packet-type (1-byte) || packet-data (variable length)
         if ( msg.length < 32+65+1+1 ) {
-            this.log.debug("Dropping packet due to invalid size", rinfo);
+            this.log.debug('Dropping packet due to invalid size', rinfo);
             return;
         }
 
         // verify the hash
         let hasher = keccak256.create().update(msg.slice(32));
         if ( 0 != msg.compare(Buffer.from(hasher.digest()), 0,32, 0, 32) ) {
-            this.log.debug("Dropping packet due to invalid hash", {calculated: hasher.hex(), received: msg.slice(0, 32).toString('hex')});
+            this.log.debug('Dropping packet due to invalid hash', {calculated: hasher.hex(), received: msg.slice(0, 32).toString('hex')});
             return;
         }
 
@@ -149,12 +112,12 @@ export class NodeDiscovery {
             // the return from recoverPubKey is a complex object
             let pubKey = this.ec.recoverPubKey(sigHasher.digest(), signature, signature.recoveryParam);
             if ( !this.ec.verify(sigHasher.digest(), signature, pubKey) ) {
-                this.log.debug("Dropping packet to due signature verification failed", signature);
+                this.log.debug('Dropping packet to due signature verification failed', signature);
                 return;
             }
             remoteId = pubk2id(pubKey);
         } catch (err) {
-            this.log.debug("Dropping packet to due invalid signature", err);
+            this.log.debug('Dropping packet to due invalid signature', err);
             return;
         }
 
@@ -164,7 +127,7 @@ export class NodeDiscovery {
         try {
             decoded = rlp.decode(msg.slice(32 + 65 + 1));
         } catch (err) {
-            this.log.debug("Dropping packet to due RLP encoding error", err);
+            this.log.debug('Dropping packet to due RLP encoding error', err);
             return;
         }
 
@@ -177,15 +140,15 @@ export class NodeDiscovery {
                 this.handlePongReceived(rinfo, remoteId, decoded);
             } else if (packetType === 0x03) {
                 // FindNeighbours
-                this.log.info("FindNeighbours packet received");
+                this.log.info('FindNeighbours packet received');
             } else if (packetType === 0x04) {
                 // Neighbors
-                this.log.info("Neighbors packet received");
+                this.log.info(`Neighbors packet received`);
             } else {
-                this.log.info("Unknown packet type: " + packetType);
+                this.log.info(`Unknown packet type: ${packetType}`);
             }
         } catch (err) {
-            this.log.debug("Error processing UDP packet", err);
+            this.log.debug('Error processing UDP packet', err);
         }
     }
 
@@ -232,7 +195,7 @@ export class NodeDiscovery {
      * The function will register the relevant data to the PingRegistry so that when we receive a PONG, we will be able to correlate the two
      * @param {Node} remote
      * @param {"events".internal.EventEmitter} eventEmitter can be null
-     * @returns {Promise<Buffer>} promise full packet as a buffer
+     * @returns {Promise<Buffer>} return full packet as a buffer
      */
     public ping(remote: Node, eventEmitter: EventEmitter) {
         let record = [
@@ -245,7 +208,7 @@ export class NodeDiscovery {
         ];
 
         let data = rlp.encode(record);
-        this.log.debug("PING-ing remote peer", remote);
+        this.log.debug('PING-ing remote peer', remote);
 
         // ping packet type is 0x01
         return this.send(remote.endpoint, 0x01, data, (packet: Buffer) => {
@@ -264,14 +227,14 @@ export class NodeDiscovery {
      * @param {"dgram".AddressInfo} rinfo
      * @param {AddressInfo} rinfo the remote node to ping
      * @param {Buffer} remoteId the remote nodeId
-     * @param {number[]} hash the hash or the received packet, we need this in the PONG reply
+     * @param {number[]} hash the hash of the received packet, we need this in the PONG reply
      * @param {Array<any>} data expected to be the output from rlp.decode(packet_data)
      */
     public handlePingReceived(rinfo: AddressInfo, remoteId: Buffer, hash: number[], data: Array<any>) {
-        let version = (data[0].readUInt8(0));
-        let remoteEndpoint = this.toEndPoint(data[1] as Array<Buffer>);
-        let myEndpoint = this.toEndPoint(data[2] as Array<Buffer>);
-        let timestamp = data[3].readUInt32BE(0);
+        const version = (data[0].readUInt8(0));
+        const remoteEndpoint = this.toEndPoint(data[1] as Array<Buffer>);
+        const myEndpoint = this.toEndPoint(data[2] as Array<Buffer>);
+        const timestamp = data[3].readUInt32BE(0);
 
         // https://github.com/ethereum/devp2p/blob/master/rlpx.md said it should be 3
         // Geth PING version is 4
@@ -281,16 +244,25 @@ export class NodeDiscovery {
             return;
         }
 
-        let now = Math.floor(new Date().getTime()/1000);
-        if (  now > timestamp ) {
-            this.log.debug("Ignore PING request due to invalid timestamp", {packet_time: timestamp});
+        if (  this.now() > timestamp ) {
+            this.log.debug('Ignore PING request due to invalid timestamp', {packet_time: timestamp});
+            return;
         }
 
-        this.log.debug("PING data received", {remote: rinfo, local: myEndpoint, hash: Buffer.from(hash).toString('hex'), timestamp: timestamp});
+        if (this.log.isDebugEnabled()) {
+            this.log.debug('PING data received', {
+                remote: rinfo,
+                local: myEndpoint,
+                hash: Buffer.from(hash).toString('hex'),
+                timestamp: timestamp
+            });
+        }
 
-        // auto reply with a PONG
         // note: we reply with rinfo, not peerEndpoint beacuse it might be behind NAT
-        this.pong(new Endpoint(rinfo.address, rinfo.port, remoteEndpoint.tcp), hash);
+        const remoteNode = new Node();
+        remoteNode.nodeId = remoteId;
+        remoteNode.endpoint = new Endpoint(rinfo.address, rinfo.port, remoteEndpoint.tcp);
+        this.emit('pingReceived', remoteNode, hash);
     }
 
     /** send a PONG request back to the remote node
@@ -308,7 +280,7 @@ export class NodeDiscovery {
         ];
 
         let data = rlp.encode(record);
-        this.log.debug("PONG-ing remote peer", remote);
+        this.log.debug('PONG-ing remote peer', remote);
 
         // ping packet type is 0x01
         return this.send(remote, 0x02, data);
@@ -345,14 +317,21 @@ export class NodeDiscovery {
                 this.log.debug("Dropping PONG packet with another nodeId", {expected: registry.remote.nodeId, actual: remoteId});
             }
             // if we don't clear all listener, we may have memory leak
-            if ( !isNullOrUndefined(registry.eventEmitter) ) registry.eventEmitter.removeAllListeners();
+            if ( registry.eventEmitter ) registry.eventEmitter.removeAllListeners();
             delete this.pingRegistry[pingHash];
             return;
         }
 
-        this.log.debug("PONG data received", {remote: rinfo, local: endpoint, hash: hash.toString('hex'), timestamp: timestamp});
+        if (this.log.isDebugEnabled()) {
+            this.log.debug("PONG data received", {
+                remote: rinfo,
+                local: endpoint,
+                hash: hash.toString('hex'),
+                timestamp: timestamp
+            });
+        }
 
-        if ( !isNullOrUndefined(registry.eventEmitter) ) {
+        if ( registry.eventEmitter ) {
             registry.eventEmitter.emit(pingHash, rinfo, remoteId);
             registry.eventEmitter.removeAllListeners();
         }
@@ -405,7 +384,7 @@ export class NodeDiscovery {
 
         if ( null != beforeSend ) beforeSend(packet);
 
-        this.log.silly("send data: " + packet.toString('hex'));
+        if (this.log.isTraceEnabled()) this.log.trace('Sending UDP packet', remote, packet);
 
         return new Promise((resolve, reject) => {
             this.server.send(packet, remote.udp, remote.ip, (err) => {
