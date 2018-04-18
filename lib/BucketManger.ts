@@ -23,14 +23,23 @@ class BucketItem {
     }
 }
 
-class Bucket {
+interface EvictionPair {
+    newNode: Node;
+    oldItem: BucketItem;
+}
+
+export class Bucket {
     /** the number of items per bucket, denoted k in Kademlia
      * Default value is 16 as specified in Ethereum's spec
      * @type {number}
      */
-    private BUCKET_SIZE = 16;
-    private challengeInProgress = 0;
-    private pendingEvictionChallengers = [];
+    public BUCKET_SIZE = 16;
+
+    /** the key is the nodeId of the existing item
+     *
+     * @type {Map<string, EvictionPair>}
+     */
+    private pendingEvictionEntries = new Map<string, EvictionPair>();
 
     public list: Array<BucketItem>;
     public lastRefresh: number;
@@ -47,15 +56,20 @@ class Bucket {
     public touchNode(node: Node) {
         // TODO: cache the calculation of node.hash to improve performance
         let idx = this.findNode(node.hash);
-        if ( idx === -1 ) {
-            assert.ok(this.list.length <= this.BUCKET_SIZE, 'Bucket size larger than BUCKET_SIZE');
-
-            if ( this.list.length === this.BUCKET_SIZE ) {
+        if ( -2 === idx ) {
+            // this node is in this.pendingEvictionEntries, give up
+        } else if ( -1 === idx ) {
+            // this node is not in this.list nor this.pendingEvictionEntries
+            assert.ok(this.list.length + this.pendingEvictionEntries.size <= this.BUCKET_SIZE, 'Bucket size larger than BUCKET_SIZE');
+            if ( this.list.length + this.pendingEvictionEntries.size === this.BUCKET_SIZE ) {
+                // bucket full
                 this.challengeLast(node);
             } else {
+                // bucket not full
                 this.list.unshift(new BucketItem(node));
             }
         } else {
+            // the node is definitely inside this.list
             let item = this.list[idx];
             item.touchNode();
             if ( idx > 0 ) {
@@ -66,46 +80,44 @@ class Bucket {
         }
     }
 
+    /**
+     *
+     * @param {number[]} hash
+     * @returns {number} return >=0 if found in this.list, -2 if found in this.pendingEvictionEntries (either oldItem or newNode), -1 if not found in either location
+     */
     public findNode(hash: number[]) {
-        return this.list.findIndex( x => _.isEqual(x.node.hash, hash) );
+        let idx = this.list.findIndex( x => _.isEqual(x.node.hash, hash) );
+        if ( -1 !== idx ) return idx;
+
+        for(let pair of this.pendingEvictionEntries.values()) {
+            if ( _.isEqual(pair.oldItem.node.hash, hash) || _.isEqual(pair.newNode.hash, hash) ) return -2;
+        }
+
+        return -1;
     }
 
     /** ping the least recently accessed node (the last node), if no pong rely, remove it and add challenger to the head, otherwise, drop challenger
-     * Note: there is a special case when two pings are received at almost the same time
-     *       i.e. we may be handling (waiting for pong reply) while we want to run evictLast again
-     *       in that case, we will just put the challenger in an array and let the other "thread" to do this for us
      * @param {Node} challenger
      */
     private challengeLast(challenger: Node) {
-        if ( this.challengeInProgress ) {
-            // if we are already running an eviction process, we will rely on another "thread" to do it for us
-            this.pendingEvictionChallengers.push(challenger);
+        if ( 0 === this.list.length ) return;
+
+        const lastItem = this.list.pop();
+        const lastNodeId = lastItem.node.nodeId.toString('hex');
+        this.pendingEvictionEntries.set(lastNodeId, {oldItem: lastItem, newNode: challenger});
+        if ( lastItem.lastAccess > new Date().getTime()-60*1000 ) {
+            this.pendingEvictionEntries.delete(lastNodeId);
+            this.list.unshift(lastItem);
         } else {
-            // while-loop because we may need to handle other items in pendingEvictionChallengers[] array as well
-            while(challenger) {
-                let lastItem = this.list[this.list.length - 1];
-                // just a safe-guard, if the lastAccess time is within 1 minute, we simply assume the node is still alive
-                if ( lastItem.lastAccess > new Date().getTime()-60*1000 ) {
-                    // do nothing, we ignore the challenger
-                } else {
-                    this.challengeInProgress++;
-                    this.discovery.pingPong(lastItem.node).then((result: { rinfo: AddressInfo, pubKey: any }) => {
-                        // pingPong successful, keep old data
-                        let tmp = this.list.pop();
-                        assert(tmp === lastItem, 'Bucket item mid-air change detected');
-                        lastItem.touchNode();
-                        this.list.unshift(lastItem);
-                        this.challengeInProgress--;
-                    }).catch((error: any) => {
-                        // pingPong failed, replace with new data
-                        let tmp = this.list.pop();
-                        assert(tmp === lastItem, 'Bucket item mid-air change detected');
-                        this.list.unshift(new BucketItem(challenger));
-                        this.challengeInProgress--;
-                    })
-                }
-                challenger = this.pendingEvictionChallengers.shift();
-            }
+            this.discovery.pingPong(lastItem.node).then((result: { rinfo: AddressInfo, pubKey: any }) => {
+                // pingPong successful, keep old data
+                this.pendingEvictionEntries.delete(lastNodeId);
+                this.list.unshift(lastItem);
+            }).catch((error: any) => {
+                // pingPong failed, replace with new data
+                this.pendingEvictionEntries.delete(lastNodeId);
+                this.list.unshift(new BucketItem(challenger));
+            })
         }
     }
 }
@@ -176,11 +188,6 @@ export class BucketManger {
         }).catch((err) => {
             // TODO: maybe we want to re-pong if err=timeout
         })
-    }
-
-    static hash(input: Buffer) : number[] {
-        let hasher = keccak256.create().update(input);
-        return hasher.digest();
     }
 
     /** Act like UNIX touch command, if the node doesn't exist we will add it to one of the bucket, and then update the last access time
