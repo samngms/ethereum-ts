@@ -1,25 +1,96 @@
-import {keccak256} from "js-sha3";
 import * as log4js from '@log4js-node/log4js-api';
 import {NodeDiscovery} from "./NodeDiscovery";
 import {Node} from './Node';
 import {AddressInfo} from "dgram";
-import {Endpoint} from "./Endpoint";
 import * as _ from 'lodash';
 import * as assert from "assert";
+import Timer = NodeJS.Timer;
+import {EventEmitter} from "events";
+import * as crypto from 'crypto';
 
 class BucketItem {
     public lastAccess: number;
+
+    private isPinging = false;
+    private extraPingObservers = [];
+    private timer: Timer;
+    public isInBucket = false;
 
     /**
      *
      * @param {Node} node
      */
-    constructor(public node: Node) {
+    constructor(public node: Node, private bucket: Bucket) {
+        this.lastAccess = Bucket.now();
+        this.startPingPongTimer();
+    }
 
+    /**
+     * To prevent traffic amplification attacks, implementations must verify that the sender of a query participates in the discovery protocol.
+     * The sender of a packet is considered verified if it has sent a valid pong response with matching ping hash within the last 12 hours.
+     * @see https://github.com/ethereum/devp2p/blob/master/discv4.md#endpoint-proof
+     */
+    public startPingPongTimer() {
+        if ( this.timer ) clearTimeout(this.timer);
+        this.timer = setTimeout(() => {
+            this.timer = null;
+            this.ping().then(() => {
+                // do nothing
+            }).catch((err) => {
+                // do nothing
+            });
+        }, 10*60*60*1000); // set timeout to 10h
+    }
+
+    public destroy() {
+        if ( this.timer ) clearTimeout(this.timer);
+        for(let e of this.extraPingObservers) {
+            e.emit('ping', new Error('Destroying BucketItem'));
+            e.removeAllListeners();
+        }
     }
 
     public touchNode() {
-        this.lastAccess = new Date().getTime();
+        this.lastAccess = Bucket.now();
+    }
+
+    /** we try to avoid two ping at the same time
+     * In general, this may not be a big problem, but there may be a problem when we are running bucket refresh and bucket eviction at exactly the same time
+     * There are two issues during that short period of time
+     * 1. the two PING packet will have the same hash (same second, same hash), and we don't handle double pingRegistry
+     * 2. bucket eviction will temporarily move BucketItem from the Bucket main list to pendingEvictionEntries
+     * Our solution is if we are in the middle of a PING-PONG, the second (and afterwards as well) ping request will just observe the result of the first ping request
+     * @returns {any}
+     * @see isInBucket
+     */
+    public ping() {
+        if ( !this.isPinging ) {
+            this.isPinging = true;
+            let self = this;
+            return this.bucket.discovery.pingPong(this.node).then(() => {
+                self.isPinging = false;
+                for (let e of self.extraPingObservers) e.emit('ping', null);
+                self.extraPingObservers = [];
+                if (self.isInBucket) self.bucket.setFirst(this);
+                self.startPingPongTimer();
+                return Promise.resolve();
+            }).catch((err) => {
+                self.isPinging = false;
+                for(let e of self.extraPingObservers) e.emit('ping', err);
+                self.extraPingObservers = [];
+                if ( self.isInBucket ) self.bucket.remove(this);
+                return Promise.reject(err);
+            });
+        } else {
+            let event = new EventEmitter();
+            this.extraPingObservers.push(event);
+            return new Promise((resolve, reject) => {
+                event.once('ping', (err) => {
+                    if ( err ) reject(err);
+                    else resolve();
+                })
+            })
+        }
     }
 }
 
@@ -33,7 +104,7 @@ export class Bucket {
      * Default value is 16 as specified in Ethereum's spec
      * @type {number}
      */
-    public BUCKET_SIZE = 16;
+    public readonly BUCKET_SIZE = 16;
 
     /** the key is the nodeId of the existing item
      *
@@ -44,15 +115,20 @@ export class Bucket {
     public list: Array<BucketItem>;
     public lastRefresh: number;
     public lastAccess: number;
+    public randomNodes : Node[] = [];
 
-    public log = log4js.getLogger('devp2p.Bucket');
+    public readonly log = log4js.getLogger('devp2p.Bucket');
 
-    constructor(private discovery: NodeDiscovery) {
+    constructor(readonly discovery: NodeDiscovery) {
         this.list = [];
         this.lastAccess = new Date().getTime();
         this.lastRefresh = this.lastAccess;
     }
 
+    /** Act like UNIX touch command, if the node doesn't exist we will add it to one of the bucket, and then update the last access time
+     * Note: don't call this function directly, you should only touch a non-existing node after successful PING-PONG
+     * @param {Node} node the remote node to touch
+     */
     public touchNode(node: Node) {
         // TODO: cache the calculation of node.hash to improve performance
         let idx = this.findNode(node.hash);
@@ -62,11 +138,15 @@ export class Bucket {
             // this node is not in this.list nor this.pendingEvictionEntries
             assert.ok(this.list.length + this.pendingEvictionEntries.size <= this.BUCKET_SIZE, 'Bucket size larger than BUCKET_SIZE');
             if ( this.list.length + this.pendingEvictionEntries.size === this.BUCKET_SIZE ) {
-                // bucket full
-                this.challengeLast(node);
+                // bucket is full
+                if ( this.list[this.list.length-1].lastAccess > Bucket.now()-60*1000 ) {
+                    // last node access time is within 60s, we simply ignore the new node
+                } else {
+                    this.challengeLast(node);
+                }
             } else {
                 // bucket not full
-                this.list.unshift(new BucketItem(node));
+                this.setFirst(new BucketItem(node, this));
             }
         } else {
             // the node is definitely inside this.list
@@ -75,7 +155,7 @@ export class Bucket {
             if ( idx > 0 ) {
                 // move it to the front
                 this.list.slice(idx, 1);
-                this.list.unshift(item);
+                this.setFirst(item);
             }
         }
     }
@@ -102,23 +182,49 @@ export class Bucket {
     private challengeLast(challenger: Node) {
         if ( 0 === this.list.length ) return;
 
-        const lastItem = this.list.pop();
+        const lastItem = this.popLast();
         const lastNodeId = lastItem.node.nodeId.toString('hex');
         this.pendingEvictionEntries.set(lastNodeId, {oldItem: lastItem, newNode: challenger});
-        if ( lastItem.lastAccess > new Date().getTime()-60*1000 ) {
+        lastItem.ping().then((result: { rinfo: AddressInfo, pubKey: any }) => {
+            // pingPong successful, keep old data
             this.pendingEvictionEntries.delete(lastNodeId);
-            this.list.unshift(lastItem);
-        } else {
-            this.discovery.pingPong(lastItem.node).then((result: { rinfo: AddressInfo, pubKey: any }) => {
-                // pingPong successful, keep old data
-                this.pendingEvictionEntries.delete(lastNodeId);
-                this.list.unshift(lastItem);
-            }).catch((error: any) => {
-                // pingPong failed, replace with new data
-                this.pendingEvictionEntries.delete(lastNodeId);
-                this.list.unshift(new BucketItem(challenger));
-            })
-        }
+            this.setFirst(lastItem);
+        }).catch((error: any) => {
+            // pingPong failed, replace with new data
+            lastItem.destroy();
+            this.pendingEvictionEntries.delete(lastNodeId);
+            this.setFirst(new BucketItem(challenger, this));
+        })
+    }
+
+    public popLast() : BucketItem {
+        const item = this.list.pop();
+        item.isInBucket = false;
+        return item;
+    }
+
+    public setFirst(item: BucketItem) {
+        this.list.unshift(item);
+        item.isInBucket = true;
+    }
+
+    public remove(item: BucketItem) {
+        let idx = this.list.findIndex(x => x === item);
+        assert(idx !== -1);
+        this.list.splice(idx, 1);
+    }
+
+    public clear() {
+        for(let item of this.list) item.destroy();
+        this.list = [];
+    }
+
+    /** current time in millisecond
+     * We have it because we need to mock it during testing
+     * @returns {number}
+     */
+    static now() {
+        return new Date().getTime();
     }
 }
 
@@ -134,11 +240,14 @@ export class BucketManger {
      * Now, as of this writing, there are below 18k Ethereum nodes in MainNet, so 10 sounds a reasonable number
      * @type {number}
      */
-    private NO_OF_BUCKETS = 10;
+    public readonly NO_OF_BUCKETS = 10;
+
+    /** how often do we need to refresh the bucket? */
+    public readonly FRESH_INTERVAL = 30*60*1000;
 
     private buckets: Array<Bucket>;
 
-    public log = log4js.getLogger('devp2p.BucketManager');
+    public readonly log = log4js.getLogger('devp2p.BucketManager');
 
     constructor(private owner: Node, private discovery: NodeDiscovery) {
         this.buckets = new Array<Bucket>(this.NO_OF_BUCKETS);
@@ -168,36 +277,72 @@ export class BucketManger {
 
         await this.discovery.listen();
 
-        let count = 0;
+        let totalCount = array.length;
+        let successfulCount = 0;
+        let emitter = new EventEmitter();
+        let result = new Promise((resolve, reject) => {
+            emitter.once('done', (successfulCount: number) => {
+                if ( successfulCount ) resolve();
+                else reject(new Error('No active peer found'));
+            })
+        });
         array.forEach((node) => {
             this.discovery.pingPong(node).then((result : {rinfo: AddressInfo, remoteId: number[]}) => {
                 if ( !node.nodeId ) node.nodeId = result.remoteId;
                 this.touchNode(node);
-                count++;
+                totalCount--;
+                successfulCount++;
+                if ( !totalCount ) emitter.emit('done', successfulCount);
             }).catch(error => {
                 this.log.info(`Error Ping-Pong: ${node}`, error);
+                totalCount--;
+                if ( !totalCount ) emitter.emit('done', successfulCount);
             })
         });
 
-        if (!count) throw new Error('No active peer found');
+        return result;
+    }
+
+    public stop() {
+        for(let bucket of this.buckets) bucket.clear();
     }
 
     private pingReceived(remote: Node, hash: number[]) {
         this.discovery.pong(remote.endpoint, hash).then(() => {
-            this.touchNode(remote);
+            if ( -1 !== this.findBucket(remote).findNode(remote.hash) ) {
+                // node already exist
+                this.touchNode(remote);
+                this.discovery.pong(remote.endpoint, hash);
+            } else {
+                // node not exist yet, in this case, we only add it after PING-PONG successful
+                this.discovery.pong(remote.endpoint, hash);
+                this.discovery.pingPong(remote).then(() => {
+                    this.touchNode(remote);
+                }).catch((err) => {
+                    // do nothing
+                });
+            }
         }).catch((err) => {
             // TODO: maybe we want to re-pong if err=timeout
         })
     }
 
-    /** Act like UNIX touch command, if the node doesn't exist we will add it to one of the bucket, and then update the last access time
+    /** find the Bucket for the node, by calculating the xor distance between my hash with node.hash
      *
-     * @param {number[]} hash expected to be keccak256 hash
-     * @param node contain any valid info about the node, should at least include ip address, udp/tcp ports
+     * @param {Node} node
+     * @returns {Bucket}
+     */
+    public findBucket(node: Node) : Bucket {
+        let dist = this.distance(this.owner.hash, node.hash);
+        return this.buckets[dist];
+    }
+
+    /** Act like UNIX touch command, if the node doesn't exist we will add it to one of the bucket, and then update the last access time
+     * Note: don't call this function directly, you should only touch a non-existing node after successful PING-PONG
+     * @param {Node} node the remote node to touch
      */
     public touchNode(node: Node) {
-        let dist = this.distance(this.owner.hash, node.hash);
-        let bucket = this.buckets[dist];
+        let bucket = this.findBucket(node);
         bucket.touchNode(node);
     }
 
@@ -224,5 +369,38 @@ export class BucketManger {
         }
 
         return i;
+    }
+
+    private startRefreshTimer() {
+        setTimeout(() => {
+            if ( !this.hasEnoughRandomNodes() ) {
+                this.fillRandomNodes(16);
+                if ( !this.hasEnoughRandomNodes() ) this.startRefreshTimer();
+            }
+            // we want to be able to finish generating all randomNodes in 1/2 of the FRESH_INTERVAL
+            // and we generate 16 random nodes in each batch
+        }, Math.round(this.FRESH_INTERVAL / 2 / Math.pow(2, this.NO_OF_BUCKETS) * 16)).unref();
+    }
+
+    private fillRandomNodes(max: number) {
+        for(let i=0; i<max; i++) {
+            let node = new Node();
+            node.nodeId = crypto.randomBytes(64);
+            let dist = this.distance(this.owner.hash, node.hash);
+            // we keep max 8 randomIds
+            if ( this.buckets[dist].randomNodes.length < 8 ) {
+                this.buckets[dist].randomNodes.push(node);
+            }
+        }
+    }
+
+    private hasEnoughRandomNodes() {
+        // loop backward
+        for(let i=this.buckets.length-1; i>=0; i--) {
+            if ( this.buckets[i].randomNodes.length === 0 ) {
+                return false;
+            }
+        }
+        return true;
     }
 }

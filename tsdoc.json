@@ -1,0 +1,37 @@
+{
+	"tags":
+	{
+		"allowUnknownTags" : true
+	},
+	"plugins":[
+		 "plugins/markdown"
+		,"/Users/ngsam/AppData/Local/Yarn/config/global/node_modules/tsdoc/template/plugins/TSDoc.js"
+	],
+	"opts":
+	{
+		"template"	:"/Users/ngsam/AppData/Local/Yarn/config/global/node_modules/tsdoc/template",
+		"recurse"	:"true"
+	},
+	"templates" : {
+		"cleverLinks"     : false,
+		"monospaceLinks"  : false
+	},
+	"source":
+	{
+		"includePattern": "(\\.d)?\\.ts$"
+	},
+	"markdown"  : {
+		"parser"   : "gfm",
+		"hardwrap" : true
+	},
+	"tsdoc":{
+		"source"		:"./lib",
+		"destination"	:"./docs",
+		"tutorials"		:"",
+		"systemName"	: "ethereum-ts",
+		"footer"		: "",
+		"copyright"		: "ethereum-ts Copyright © 2018 Sam Ng.",
+		"outputSourceFiles" : true,
+		"commentsOnly": true
+	}
+}

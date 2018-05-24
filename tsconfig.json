@@ -1,6 +1,7 @@
 {
   "version": "2.6",
   "compilerOptions": {
+    "sourceMap": true,
     //"lib": [ "es6" ],
     "module": "commonjs",
     "target": "es2017" // we want async/await

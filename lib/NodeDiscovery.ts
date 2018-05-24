@@ -9,6 +9,7 @@ import {EventEmitter} from "events";
 import {Endpoint} from "./Endpoint";
 import {Node} from "./Node";
 import {pubk2id} from "./Util";
+import * as _ from 'lodash';
 
 // internal use only
 interface PingRegistryObject {
@@ -21,6 +22,11 @@ interface PingRegistryObject {
     eventEmitter: EventEmitter;
 }
 
+/** The Node Discovery UDP protocol
+ * The class handles the message encryption/decryption, encode/decode, send/receive, etc...
+ * The class is designed to be used by BucketManager
+ * @see BucketManager
+ */
 export class NodeDiscovery extends EventEmitter {
     private ec = new elliptic.ec('secp256k1');
     private started = false;
@@ -84,6 +90,10 @@ export class NodeDiscovery extends EventEmitter {
         });
     }
 
+    /** return the current time in second
+     *
+     * @returns {number}
+     */
     public now() : number {
         return Math.floor(new Date().getTime()/1000);
     }
@@ -111,10 +121,11 @@ export class NodeDiscovery extends EventEmitter {
         try {
             // the return from recoverPubKey is a complex object
             let pubKey = this.ec.recoverPubKey(sigHasher.digest(), signature, signature.recoveryParam);
-            if ( !this.ec.verify(sigHasher.digest(), signature, pubKey) ) {
-                this.log.debug('Dropping packet to due signature verification failed', signature);
-                return;
-            }
+            // the following is not needed, a successfully recovered public key is internally checked with verify
+            // if ( !this.ec.verify(sigHasher.digest(), signature, pubKey) ) {
+            //     this.log.debug('Dropping packet to due signature verification failed', signature);
+            //     return;
+            // }
             remoteId = pubk2id(pubKey);
         } catch (err) {
             this.log.debug('Dropping packet to due invalid signature', err);
@@ -145,7 +156,7 @@ export class NodeDiscovery extends EventEmitter {
                 // Neighbors
                 this.log.info(`Neighbors packet received`);
             } else {
-                this.log.info(`Unknown packet type: ${packetType}`);
+                this.log.info(`Received an unknown packet type: ${packetType}`);
             }
         } catch (err) {
             this.log.debug('Error processing UDP packet', err);
@@ -204,11 +215,10 @@ export class NodeDiscovery extends EventEmitter {
             [remote.endpoint.ipAsBuffer, remote.endpoint.udp, remote.endpoint.tcp],
             // "+expiryTime" because peers will ignore the ping request if timestamp is from the past
             this.now() + this.expiryTime
-            //0x5ab09d9c
         ];
 
         let data = rlp.encode(record);
-        this.log.debug('PING-ing remote peer', remote);
+        this.log.debug('Sending PING packet to remote peer', remote);
 
         // ping packet type is 0x01
         return this.send(remote.endpoint, 0x01, data, (packet: Buffer) => {
@@ -280,13 +290,13 @@ export class NodeDiscovery extends EventEmitter {
         ];
 
         let data = rlp.encode(record);
-        this.log.debug('PONG-ing remote peer', remote);
+        this.log.debug('Sending PONG packet to remote peer', remote);
 
-        // ping packet type is 0x01
+        // pong packet type is 0x02
         return this.send(remote, 0x02, data);
     }
 
-    /** handle the received PONG request
+    /** handle PONG request (remote node send PONG back to us)
      *
      * @param {"dgram".AddressInfo} rinfo
      * @param {Buffer} remoteId the recovered sender public key, total 64 bytes long, w/o leading '0x04'
@@ -314,7 +324,7 @@ export class NodeDiscovery extends EventEmitter {
             } else if ( !registry.remote.nodeId && registry.remote.endpoint.ip != rinfo.address ) {
                 this.log.debug("Dropping PONG packet from unexpected IP", {expected: registry.remote.endpoint.ip, actual: rinfo.address});
             } else {
-                this.log.debug("Dropping PONG packet with another nodeId", {expected: registry.remote.nodeId, actual: remoteId});
+                this.log.debug("Dropping PONG packet with unexpected nodeId", {expected: registry.remote.nodeId, actual: remoteId});
             }
             // if we don't clear all listener, we may have memory leak
             if ( registry.eventEmitter ) registry.eventEmitter.removeAllListeners();
@@ -336,6 +346,120 @@ export class NodeDiscovery extends EventEmitter {
             registry.eventEmitter.removeAllListeners();
         }
         delete this.pingRegistry[pingHash];
+    }
+
+    /** send a FindNode packet (0x03)
+     * packet-data = [target, expiration]
+     * @param {Endpoint} remote node to send packet to
+     * @param {Buffer} target 65-byte public key
+     * @returns {Promise<Buffer>}
+     */
+    public findNode(remote: Endpoint, target: Buffer) {
+        let record = [
+            target,
+            // "+expiryTime" because peers will ignore the ping request if timestamp is from the past
+            this.now() + this.expiryTime
+        ];
+
+        let data = rlp.encode(record);
+        this.log.debug('Sending FINDNODE packet to remote peer', remote);
+
+        // findNode packet type is 0x03
+        return this.send(remote, 0x03, data);
+    }
+
+    public handleFindNodeReceived(rinfo: AddressInfo, remoteId: Buffer, packetData: Array<any>) : void {
+        let target : Buffer = packetData[0];
+        let b = (target instanceof Buffer);
+        // if I put the above instanceof into the following if-condition, it will have compile-time error
+        if ( !b || (target.length != 65)) {
+            this.log.debug(!b ? 'Invalid target in findNode packet' : 'Incorrect target length in findNode packet', {
+                remote: rinfo,
+                nodeId: remoteId.toString('hex'),
+                packetData: packetData
+            });
+            return;
+        }
+        let expiration = packetData[1];
+        if ( !_.isNumber(expiration) || expiration < this.now() ) {
+            this.log.debug(_.isNumber(expiration) ? 'Expired findNode packet' : 'Invalid expiration in findNode packet', {
+                remote: rinfo,
+                nodeId: remoteId.toString('hex'),
+                packetData: packetData
+            });
+            return;
+        }
+        this.emit('findNodeReceived', {nodeId: remoteId, target: target});
+    }
+
+    /** send a Neighbors Packet (0x04)
+     * packet-data = [nodes, expiration]
+     * nodes = [[ip, udp-port, tcp-port, node-id], ... ]
+     * @param {Endpoint} remote node to send packet to
+     * @param {Node[]} nodes
+     * @returns {Promise<Buffer>}
+     */
+    public neighbor(remote: Endpoint, nodes: Node[]) {
+        let list = [];
+        for(let node of nodes) {
+            let tmp = rlp.encode([
+                node.endpoint.ip,
+                node.endpoint.udp,
+                node.endpoint.tcp,
+                node.nodeId
+            ]);
+            list.push(tmp);
+        }
+        let record = [
+            list,
+            // "+expiryTime" because peers will ignore the ping request if timestamp is from the past
+            this.now() + this.expiryTime
+        ];
+
+        let data = rlp.encode(record);
+        this.log.debug('Sending NEIGHBOR packet to remote peer', remote);
+
+        // findNode packet type is 0x03
+        return this.send(remote, 0x04, data);
+    }
+
+    public handleNeighborsReceived(rinfo: AddressInfo, remoteId: Buffer, packetData: Array<any>) : void {
+        let array = packetData[0] as Array<Array<Buffer>>;
+        if ( !_.isArray(array) ) {
+            this.log.debug('Result is not an array in NEIGHBOUR packet', {
+                remote: rinfo,
+                nodeId: remoteId.toString('hex'),
+                packetData: packetData
+            });
+            return;
+        }
+        let expiration = packetData[1];
+        if ( !_.isNumber(expiration) || expiration < this.now() ) {
+            this.log.debug(_.isNumber(expiration) ? 'Expired NEIGHBOUR packet' : 'Invalid expiration in NEIGHBOUR packet', {
+                remote: rinfo,
+                nodeId: remoteId.toString('hex'),
+                packetData: packetData
+            });
+            return;
+        }
+
+        let nodes: Array<Node>;
+        for(let item of array) {
+            let tmp = this.toEndPoint(item);
+            let n = Node.fromIpAndPort(tmp.address, tmp.udp, tmp.tcp);
+            n.nodeId = item[3];
+            let b = (n.nodeId instanceof Buffer);
+            if( !b || n.nodeId.length !== 65 ) {
+                this.log.debug(!b ? 'Invalid node in NEIGHBOUR packet' : 'Incorrect id length in NEIGHBOUR packet', {
+                    remote: rinfo,
+                    nodeId: remoteId.toString('hex'),
+                    data: n.nodeId
+                });
+            } else {
+                nodes.push(n);
+            }
+        }
+        this.emit('neighborsReceived', {nodeId: remoteId, nodes: nodes});
     }
 
     public toEndPoint(data: Array<Buffer>) {
@@ -382,7 +506,7 @@ export class NodeDiscovery extends EventEmitter {
         let hasher = keccak256.create().update(packet.slice(32));
         packet.set(hasher.digest());
 
-        if ( null != beforeSend ) beforeSend(packet);
+        if ( beforeSend ) beforeSend(packet);
 
         if (this.log.isTraceEnabled()) this.log.trace('Sending UDP packet', remote, packet);
 

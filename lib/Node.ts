@@ -24,9 +24,9 @@ export class Node {
         return n;
     }
 
-    static fromIpAndPort(ip: string, udp: number) : Node {
+    static fromIpAndPort(ip: string, udp: number, tcp: number = NaN) : Node {
         let n = new Node();
-        n.endpoint = new Endpoint(ip, udp, udp);
+        n.endpoint = new Endpoint(ip, udp, isNaN(tcp) ? udp : tcp);
         return n;
     }
 
