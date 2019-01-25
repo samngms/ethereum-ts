@@ -1,0 +1,18 @@
+{
+  "summary": {
+    "title": "My Title",
+    "owner": "Sam",
+    "description": "Sample"
+  },
+  "detail": {
+    "contributors": [],
+    "diagrams": [
+      {
+        "title": "Sample",
+        "thumbnail": "./public/content/images/thumbnail.jpg",
+        "id": 0
+      }
+    ],
+    "reviewer": "Sam"
+  }
+}
